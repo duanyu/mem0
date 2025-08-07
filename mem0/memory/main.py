@@ -192,6 +192,7 @@ class Memory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        threshold: Optional[float] = 0.0,
     ):
         """
         Create a new memory.
@@ -254,7 +255,7 @@ class Memory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer)
+            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer, threshold)
             future2 = executor.submit(self._add_to_graph, messages, effective_filters)
 
             concurrent.futures.wait([future1, future2])
@@ -280,7 +281,7 @@ class Memory(MemoryBase):
 
         return {"results": vector_store_result}
 
-    def _add_to_vector_store(self, messages, metadata, filters, infer):
+    def _add_to_vector_store(self, messages, metadata, filters, infer, threshold):
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -355,7 +356,9 @@ class Memory(MemoryBase):
                 filters=filters,
             )
             for mem in existing_memories:
-                retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
+                if mem.score >= threshold:
+                    # 只有相似度大于某一阈值，才加入
+                    retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
 
         unique_data = {}
         for item in retrieved_old_memory:
@@ -370,27 +373,35 @@ class Memory(MemoryBase):
             retrieved_old_memory[idx]["id"] = str(idx)
 
         if new_retrieved_facts:
-            function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
-            )
-
-            try:
-                response: str = self.llm.generate_response(
-                    messages=[{"role": "user", "content": function_calling_prompt}],
-                    response_format={"type": "json_object"},
+            if len(retrieved_old_memory) == 0:
+                # 如果没有retrieved_old_memory，则所有mem直接执行ADD
+                new_memories_with_actions = {"memory": []}
+                for fact_i, fact in enumerate(new_retrieved_facts):
+                    new_memories_with_actions["memory"].append({'id': fact_i, 'text': fact, 'event': 'ADD'})
+            else:
+                function_calling_prompt = get_update_memory_messages(
+                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
                 )
-            except Exception as e:
-                logger.error(f"Error in new memory actions response: {e}")
-                response = ""
-
-            try:
-                response = remove_code_blocks(response)
-                new_memories_with_actions = json.loads(response)
-            except Exception as e:
-                logger.error(f"Invalid JSON response: {e}")
-                new_memories_with_actions = {}
+    
+                try:
+                    response: str = self.llm.generate_response(
+                        messages=[{"role": "user", "content": function_calling_prompt}],
+                        response_format={"type": "json_object"},
+                    )
+                except Exception as e:
+                    logger.error(f"Error in new memory actions response: {e}")
+                    response = ""
+    
+                try:
+                    response = remove_code_blocks(response)
+                    new_memories_with_actions = json.loads(response)
+                except Exception as e:
+                    logger.error(f"Invalid JSON response: {e}")
+                    new_memories_with_actions = {}
         else:
             new_memories_with_actions = {}
+
+        # logger.error(f"new_memories_with_actions:\n{json.dumps(new_memories_with_actions, ensure_ascii=False, indent=2)}")
 
         returned_memories = []
         try:
