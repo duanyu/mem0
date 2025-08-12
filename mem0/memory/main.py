@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 import warnings
 from copy import deepcopy
@@ -334,6 +335,8 @@ class Memory(MemoryBase):
             response_format={"type": "json_object"},
         )
 
+        print('new_retrieved_facts response', json.dumps(response, ensure_ascii=False, indent=2))
+
         try:
             response = remove_code_blocks(response)
             new_retrieved_facts = json.loads(response)["facts"]
@@ -346,19 +349,33 @@ class Memory(MemoryBase):
 
         retrieved_old_memory = []
         new_message_embeddings = {}
-        for new_mem in new_retrieved_facts:
-            messages_embeddings = self.embedding_model.embed(new_mem, "add")
-            new_message_embeddings[new_mem] = messages_embeddings
-            existing_memories = self.vector_store.search(
-                query=new_mem,
-                vectors=messages_embeddings,
-                limit=5,
-                filters=filters,
-            )
-            for mem in existing_memories:
-                if mem.score >= threshold:
-                    # 只有相似度大于某一阈值，才加入
-                    retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
+        new_temporal_facts = []
+        new_non_temporal_facts = []
+        
+        for new_mem_obj in new_retrieved_facts:
+            new_mem = new_mem_obj['text']
+            new_mem_date = new_mem_obj['date']
+            if len(new_mem_date) > 0 and bool(re.match(r'^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$'
+, new_mem_date)):
+                # temporal memory
+                new_temporal_facts.append({'text': new_mem, 'date': new_mem_date})
+            else:
+                # non-temporal memory
+                new_non_temporal_facts.append(new_mem)
+                messages_embeddings = self.embedding_model.embed(new_mem, "add")
+                new_message_embeddings[new_mem] = messages_embeddings
+                existing_memories = self.vector_store.search(
+                    query=new_mem,
+                    vectors=messages_embeddings,
+                    limit=5,
+                    filters=filters,
+                )
+                for mem in existing_memories:
+                    if mem.score >= threshold:
+                        # 只有相似度大于某一阈值，才加入
+                        retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
+
+        
 
         unique_data = {}
         for item in retrieved_old_memory:
@@ -372,15 +389,15 @@ class Memory(MemoryBase):
             temp_uuid_mapping[str(idx)] = item["id"]
             retrieved_old_memory[idx]["id"] = str(idx)
 
-        if new_retrieved_facts:
+        if new_non_temporal_facts:
             if len(retrieved_old_memory) == 0:
                 # 如果没有retrieved_old_memory，则所有mem直接执行ADD
                 new_memories_with_actions = {"memory": []}
-                for fact_i, fact in enumerate(new_retrieved_facts):
+                for fact_i, fact in enumerate(new_non_temporal_facts):
                     new_memories_with_actions["memory"].append({'id': fact_i, 'text': fact, 'event': 'ADD'})
             else:
                 function_calling_prompt = get_update_memory_messages(
-                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                    retrieved_old_memory, new_non_temporal_facts, self.config.custom_update_memory_prompt
                 )
     
                 try:
@@ -399,9 +416,13 @@ class Memory(MemoryBase):
                     logger.error(f"Invalid JSON response: {e}")
                     new_memories_with_actions = {}
         else:
-            new_memories_with_actions = {}
+            new_memories_with_actions = {"memory": []}
+        
+        # 加入temporal memory（不参与update，直接add）
+        for mem_i, mem in enumerate(new_temporal_facts):
+            new_memories_with_actions["memory"].append({'id': len(new_retrieved_facts)+mem_i, 'text': mem['text'], 'event': 'ADD', 'date': mem['date']})
 
-        # logger.error(f"new_memories_with_actions:\n{json.dumps(new_memories_with_actions, ensure_ascii=False, indent=2)}")
+        logger.error(f"new_memories_with_actions:\n{json.dumps(new_memories_with_actions, ensure_ascii=False, indent=2)}")
 
         returned_memories = []
         try:
@@ -409,6 +430,10 @@ class Memory(MemoryBase):
                 logger.info(resp)
                 try:
                     action_text = resp.get("text")
+                    new_metadata = deepcopy(metadata)
+                    if resp.get("date"):
+                        new_metadata['date'] = resp.get("date")
+                    
                     if not action_text:
                         logger.info("Skipping memory entry because of empty `text` field.")
                         continue
@@ -418,7 +443,7 @@ class Memory(MemoryBase):
                         memory_id = self._create_memory(
                             data=action_text,
                             existing_embeddings=new_message_embeddings,
-                            metadata=deepcopy(metadata),
+                            metadata=new_metadata,
                         )
                         returned_memories.append({"id": memory_id, "memory": action_text, "event": event_type})
                     elif event_type == "UPDATE":
@@ -426,7 +451,7 @@ class Memory(MemoryBase):
                             memory_id=temp_uuid_mapping[resp.get("id")],
                             data=action_text,
                             existing_embeddings=new_message_embeddings,
-                            metadata=deepcopy(metadata),
+                            metadata=new_metadata,
                         )
                         returned_memories.append(
                             {
