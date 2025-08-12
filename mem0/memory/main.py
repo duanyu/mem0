@@ -354,8 +354,8 @@ class Memory(MemoryBase):
         
         for new_mem_obj in new_retrieved_facts:
             new_mem = new_mem_obj['text']
-            new_mem_date = new_mem_obj['date']
-            if len(new_mem_date) > 0 and bool(re.match(r'^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$'
+            new_mem_date = new_mem_obj.get('date')
+            if new_mem_date is not None and len(new_mem_date) > 0 and bool(re.match(r'^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$'
 , new_mem_date)):
                 # temporal memory
                 new_temporal_facts.append({'text': new_mem, 'date': new_mem_date})
